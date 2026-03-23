@@ -105,6 +105,10 @@ def apply_conditioning(
         frame_idx = cond.frame_idx
         strength = cond.strength
 
+        # Normalize negative indices (e.g. -1 -> last frame)
+        if frame_idx < 0:
+            frame_idx = frame_idx % f
+
         # Validate shapes
         _, cond_c, cond_f, cond_h, cond_w = cond_latent.shape
         if (cond_c, cond_h, cond_w) != (c, h, w):
