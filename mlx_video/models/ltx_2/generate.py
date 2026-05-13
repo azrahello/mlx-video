@@ -887,6 +887,9 @@ def denoise_dev_av(
     stg_audio_blocks: Optional[list] = None,
     modality_scale: float = 1.0,
     audio_frozen: bool = False,
+    guiding_tokens: Optional[mx.array] = None,
+    guiding_positions: Optional[mx.array] = None,
+    guiding_strength: float = 1.0,
 ) -> tuple[mx.array, mx.array]:
     """Run denoising loop for dev pipeline with CFG/APG, STG, modality guidance, and audio.
 
@@ -942,6 +945,24 @@ def denoise_dev_av(
         double_precision=transformer.config.double_precision_rope,
     )
     mx.eval(precomputed_video_rope, precomputed_audio_rope)
+
+    # Pre-compute extended RoPE covering video + guiding tokens (once, outside loop).
+    n_guiding = 0
+    extended_video_rope = precomputed_video_rope
+    if guiding_tokens is not None:
+        n_guiding = guiding_tokens.shape[1]
+        extended_positions = mx.concatenate([video_positions, guiding_positions], axis=2)
+        extended_video_rope = precompute_freqs_cis(
+            extended_positions,
+            dim=transformer.inner_dim,
+            theta=transformer.positional_embedding_theta,
+            max_pos=transformer.positional_embedding_max_pos,
+            use_middle_indices_grid=transformer.use_middle_indices_grid,
+            num_attention_heads=transformer.num_attention_heads,
+            rope_type=transformer.rope_type,
+            double_precision=transformer.config.double_precision_rope,
+        )
+        mx.eval(extended_video_rope)
 
     with Progress(
         SpinnerColumn(),
@@ -1001,14 +1022,28 @@ def denoise_dev_av(
                 if audio_frozen
                 else mx.full((ab,), sigma, dtype=dtype)
             )
+
+            # Build extended sequence if end-frame guiding tokens are active.
+            if guiding_tokens is not None:
+                cond_ts = mx.full(
+                    (b, n_guiding), sigma * (1.0 - guiding_strength), dtype=dtype
+                )
+                seq_video_flat = mx.concatenate(
+                    [video_flat, guiding_tokens.astype(dtype)], axis=1
+                )
+                seq_video_timesteps = mx.concatenate([video_timesteps, cond_ts], axis=1)
+            else:
+                seq_video_flat = video_flat
+                seq_video_timesteps = video_timesteps
+
             video_modality_pos = Modality(
-                latent=video_flat,
-                timesteps=video_timesteps,
+                latent=seq_video_flat,
+                timesteps=seq_video_timesteps,
                 positions=video_positions,
                 context=video_embeddings_pos,
                 context_mask=None,
                 enabled=True,
-                positional_embeddings=precomputed_video_rope,
+                positional_embeddings=extended_video_rope,
                 sigma=sigma_array,
             )
             audio_modality_pos = Modality(
@@ -1024,6 +1059,8 @@ def denoise_dev_av(
             video_vel_pos, audio_vel_pos = transformer(
                 video=video_modality_pos, audio=audio_modality_pos
             )
+            if guiding_tokens is not None:
+                video_vel_pos = video_vel_pos[:, :num_video_tokens, :]
             mx.eval(video_vel_pos, audio_vel_pos)
 
             # Convert velocity to denoised (x0) using per-token timesteps
@@ -1057,13 +1094,13 @@ def denoise_dev_av(
             # Pass 2: CFG (negative conditioning)
             if use_cfg:
                 video_modality_neg = Modality(
-                    latent=video_flat,
-                    timesteps=video_timesteps,
+                    latent=seq_video_flat,
+                    timesteps=seq_video_timesteps,
                     positions=video_positions,
                     context=video_embeddings_neg,
                     context_mask=None,
                     enabled=True,
-                    positional_embeddings=precomputed_video_rope,
+                    positional_embeddings=extended_video_rope,
                     sigma=sigma_array,
                 )
                 audio_modality_neg = Modality(
@@ -1079,6 +1116,8 @@ def denoise_dev_av(
                 video_vel_neg, audio_vel_neg = transformer(
                     video=video_modality_neg, audio=audio_modality_neg
                 )
+                if guiding_tokens is not None:
+                    video_vel_neg = video_vel_neg[:, :num_video_tokens, :]
                 mx.eval(video_vel_neg, audio_vel_neg)
 
                 video_x0_neg_f32 = (
@@ -1114,6 +1153,8 @@ def denoise_dev_av(
                     stg_video_blocks=stg_video_blocks,
                     stg_audio_blocks=stg_audio_blocks,
                 )
+                if guiding_tokens is not None:
+                    video_vel_ptb = video_vel_ptb[:, :num_video_tokens, :]
                 mx.eval(video_vel_ptb, audio_vel_ptb)
 
                 video_x0_ptb_f32 = (
@@ -1139,6 +1180,8 @@ def denoise_dev_av(
                     audio=audio_modality_pos,
                     skip_cross_modal=True,
                 )
+                if guiding_tokens is not None:
+                    video_vel_iso = video_vel_iso[:, :num_video_tokens, :]
                 mx.eval(video_vel_iso, audio_vel_iso)
 
                 video_x0_iso_f32 = (
@@ -1235,6 +1278,9 @@ def denoise_res2s_av(
     bongmath: bool = True,
     bongmath_max_iter: int = 100,
     audio_frozen: bool = False,
+    guiding_tokens: Optional[mx.array] = None,
+    guiding_positions: Optional[mx.array] = None,
+    guiding_strength: float = 1.0,
 ) -> tuple[mx.array, mx.array]:
     """Run res_2s second-order denoising loop with CFG/STG/modality guidance.
 
@@ -1302,6 +1348,24 @@ def denoise_res2s_av(
     )
     mx.eval(precomputed_video_rope, precomputed_audio_rope)
 
+    # Pre-compute extended RoPE for guiding tokens (once, outside loop).
+    n_guiding = 0
+    extended_video_rope = precomputed_video_rope
+    if guiding_tokens is not None:
+        n_guiding = guiding_tokens.shape[1]
+        extended_positions = mx.concatenate([video_positions, guiding_positions], axis=2)
+        extended_video_rope = precompute_freqs_cis(
+            extended_positions,
+            dim=transformer.inner_dim,
+            theta=transformer.positional_embedding_theta,
+            max_pos=transformer.positional_embedding_max_pos,
+            use_middle_indices_grid=transformer.use_middle_indices_grid,
+            num_attention_heads=transformer.num_attention_heads,
+            rope_type=transformer.rope_type,
+            double_precision=transformer.config.double_precision_rope,
+        )
+        mx.eval(extended_video_rope)
+
     phi_cache = {}
     c2 = 0.5
 
@@ -1342,15 +1406,28 @@ def denoise_res2s_av(
             else mx.full((ab,), sigma, dtype=dtype)
         )
 
+        # Build extended sequence if end-frame guiding tokens are active.
+        if guiding_tokens is not None:
+            cond_ts = mx.full(
+                (b, n_guiding), sigma * (1.0 - guiding_strength), dtype=dtype
+            )
+            seq_video_flat = mx.concatenate(
+                [video_flat, guiding_tokens.astype(dtype)], axis=1
+            )
+            seq_video_timesteps = mx.concatenate([video_timesteps, cond_ts], axis=1)
+        else:
+            seq_video_flat = video_flat
+            seq_video_timesteps = video_timesteps
+
         # Pass 1: Positive conditioning
         video_modality_pos = Modality(
-            latent=video_flat,
-            timesteps=video_timesteps,
+            latent=seq_video_flat,
+            timesteps=seq_video_timesteps,
             positions=video_positions,
             context=video_embeddings_pos,
             context_mask=None,
             enabled=True,
-            positional_embeddings=precomputed_video_rope,
+            positional_embeddings=extended_video_rope,
             sigma=sigma_array,
         )
         audio_modality_pos = Modality(
@@ -1366,6 +1443,8 @@ def denoise_res2s_av(
         video_vel_pos, audio_vel_pos = transformer(
             video=video_modality_pos, audio=audio_modality_pos
         )
+        if guiding_tokens is not None:
+            video_vel_pos = video_vel_pos[:, :num_video_tokens, :]
         mx.eval(video_vel_pos, audio_vel_pos)
 
         # Convert velocity to x0
@@ -1385,13 +1464,13 @@ def denoise_res2s_av(
         # Pass 2: CFG
         if use_cfg:
             video_modality_neg = Modality(
-                latent=video_flat,
-                timesteps=video_timesteps,
+                latent=seq_video_flat,
+                timesteps=seq_video_timesteps,
                 positions=video_positions,
                 context=video_embeddings_neg,
                 context_mask=None,
                 enabled=True,
-                positional_embeddings=precomputed_video_rope,
+                positional_embeddings=extended_video_rope,
                 sigma=sigma_array,
             )
             audio_modality_neg = Modality(
@@ -1407,6 +1486,8 @@ def denoise_res2s_av(
             video_vel_neg, audio_vel_neg = transformer(
                 video=video_modality_neg, audio=audio_modality_neg
             )
+            if guiding_tokens is not None:
+                video_vel_neg = video_vel_neg[:, :num_video_tokens, :]
             mx.eval(video_vel_neg, audio_vel_neg)
 
             video_x0_neg = video_flat_f32 - video_ts_f32 * video_vel_neg.astype(
@@ -1431,6 +1512,8 @@ def denoise_res2s_av(
                 stg_video_blocks=stg_video_blocks,
                 stg_audio_blocks=stg_audio_blocks,
             )
+            if guiding_tokens is not None:
+                video_vel_ptb = video_vel_ptb[:, :num_video_tokens, :]
             mx.eval(video_vel_ptb, audio_vel_ptb)
 
             video_x0_ptb = video_flat_f32 - video_ts_f32 * video_vel_ptb.astype(
@@ -1454,6 +1537,8 @@ def denoise_res2s_av(
                 audio=audio_modality_pos,
                 skip_cross_modal=True,
             )
+            if guiding_tokens is not None:
+                video_vel_iso = video_vel_iso[:, :num_video_tokens, :]
             mx.eval(video_vel_iso, audio_vel_iso)
 
             video_x0_iso = video_flat_f32 - video_ts_f32 * video_vel_iso.astype(
@@ -2433,6 +2518,12 @@ def generate_video(
             latents = mx.random.normal(video_latent_shape, dtype=model_dtype)
             mx.eval(latents)
 
+        dev_guiding_tokens, dev_guiding_positions = None, None
+        if end_image_latent is not None:
+            dev_guiding_tokens, dev_guiding_positions = _prepare_guiding_tokens(
+                end_image_latent, video_positions, latent_frames, latent_h, latent_w
+            )
+
         # Always use A/V denoising - PyTorch always processes audio+video jointly
         latents, audio_latents = denoise_dev_av(
             latents,
@@ -2458,6 +2549,9 @@ def generate_video(
             stg_audio_blocks=stg_blocks,
             modality_scale=modality_scale,
             audio_frozen=is_a2v,
+            guiding_tokens=dev_guiding_tokens,
+            guiding_positions=dev_guiding_positions,
+            guiding_strength=end_image_strength,
         )
 
         # Load VAE decoder (for dev pipeline, loaded here instead of during upsampling)
@@ -2563,6 +2657,12 @@ def generate_video(
             latents = mx.random.normal(stage1_shape, dtype=model_dtype)
             mx.eval(latents)
 
+        s1_guiding_tokens, s1_guiding_positions = None, None
+        if stage1_end_image_latent is not None:
+            s1_guiding_tokens, s1_guiding_positions = _prepare_guiding_tokens(
+                stage1_end_image_latent, positions, latent_frames, stage1_h, stage1_w
+            )
+
         # Stage 1: Always use joint AV denoising (matches PyTorch)
         latents, audio_latents = denoise_dev_av(
             latents,
@@ -2588,6 +2688,9 @@ def generate_video(
             stg_audio_blocks=stg_blocks,
             modality_scale=modality_scale,
             audio_frozen=is_a2v,
+            guiding_tokens=s1_guiding_tokens,
+            guiding_positions=s1_guiding_positions,
+            guiding_strength=end_image_strength,
         )
 
         mx.eval(audio_latents)
@@ -2683,6 +2786,13 @@ def generate_video(
             )
             mx.eval(audio_latents)
 
+        s2_guiding_tokens, s2_guiding_positions = None, None
+        if stage2_end_image_latent is not None:
+            positions2 = create_position_grid(1, latent_frames, stage2_h, stage2_w)
+            s2_guiding_tokens, s2_guiding_positions = _prepare_guiding_tokens(
+                stage2_end_image_latent, positions2, latent_frames, stage2_h, stage2_w
+            )
+
         # Joint video + audio refinement (no CFG, positive embeddings only)
         latents, audio_latents = denoise_distilled(
             latents,
@@ -2696,6 +2806,9 @@ def generate_video(
             audio_positions=audio_positions,
             audio_embeddings=audio_embeddings_pos,
             audio_frozen=is_a2v,
+            guiding_tokens=s2_guiding_tokens,
+            guiding_positions=s2_guiding_positions,
+            guiding_strength=end_image_strength,
         )
 
     elif pipeline == PipelineType.DEV_TWO_STAGE_HQ:
@@ -2836,6 +2949,12 @@ def generate_video(
             latents = mx.random.normal(stage1_shape, dtype=model_dtype)
             mx.eval(latents)
 
+        hq_s1_guiding_tokens, hq_s1_guiding_positions = None, None
+        if stage1_end_image_latent is not None:
+            hq_s1_guiding_tokens, hq_s1_guiding_positions = _prepare_guiding_tokens(
+                stage1_end_image_latent, positions, latent_frames, stage1_h, stage1_w
+            )
+
         # Stage 1: res_2s with CFG (STG disabled for HQ by default)
         latents, audio_latents = denoise_res2s_av(
             latents,
@@ -2860,6 +2979,9 @@ def generate_video(
             modality_scale=modality_scale,
             noise_seed=seed,
             audio_frozen=is_a2v,
+            guiding_tokens=hq_s1_guiding_tokens,
+            guiding_positions=hq_s1_guiding_positions,
+            guiding_strength=end_image_strength,
         )
 
         mx.eval(audio_latents)
@@ -2947,6 +3069,13 @@ def generate_video(
             )
             mx.eval(audio_latents)
 
+        hq_s2_guiding_tokens, hq_s2_guiding_positions = None, None
+        if stage2_end_image_latent is not None:
+            hq_positions2 = create_position_grid(1, latent_frames, stage2_h, stage2_w)
+            hq_s2_guiding_tokens, hq_s2_guiding_positions = _prepare_guiding_tokens(
+                stage2_end_image_latent, hq_positions2, latent_frames, stage2_h, stage2_w
+            )
+
         # Stage 2: res_2s with no CFG (positive embeddings only)
         stage2_sigmas = mx.array(STAGE_2_SIGMAS, dtype=mx.float32)
         latents, audio_latents = denoise_res2s_av(
@@ -2967,6 +3096,9 @@ def generate_video(
             video_state=state2,
             noise_seed=seed + 1,
             audio_frozen=is_a2v,
+            guiding_tokens=hq_s2_guiding_tokens,
+            guiding_positions=hq_s2_guiding_positions,
+            guiding_strength=end_image_strength,
         )
 
     del transformer
