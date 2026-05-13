@@ -483,8 +483,17 @@ def denoise_distilled(
     audio_positions: Optional[mx.array] = None,
     audio_embeddings: Optional[mx.array] = None,
     audio_frozen: bool = False,
+    guiding_tokens: Optional[mx.array] = None,
+    guiding_positions: Optional[mx.array] = None,
+    guiding_strength: float = 1.0,
 ) -> tuple[mx.array, Optional[mx.array]]:
-    """Run denoising loop for distilled pipeline (no CFG)."""
+    """Run denoising loop for distilled pipeline (no CFG).
+
+    guiding_tokens/guiding_positions: end-frame conditioning via token appending
+    (LTX-2 KeyframeIndex approach). Tokens are appended to the video sequence
+    before the transformer so the model attends to them without hard-replacing
+    any video token, producing smoother transitions to the target end frame.
+    """
     dtype = latents.dtype
     enable_audio = audio_latents is not None
 
@@ -528,10 +537,31 @@ def denoise_distilled(
             else:
                 timesteps = mx.full((b, num_tokens), sigma, dtype=dtype)
 
+            # Append guiding tokens (end-frame keyframe conditioning).
+            # Tokens are appended to the sequence so the transformer attends to
+            # them without replacing any video token — avoids the hard boundary
+            # that causes abrupt appearance changes near the end frame.
+            if guiding_tokens is not None:
+                n_cond = guiding_tokens.shape[1]
+                cond_ts = mx.full(
+                    (b, n_cond),
+                    sigma * (1.0 - guiding_strength),
+                    dtype=dtype,
+                )
+                seq_latent = mx.concatenate(
+                    [latents_flat, guiding_tokens.astype(dtype)], axis=1
+                )
+                seq_timesteps = mx.concatenate([timesteps, cond_ts], axis=1)
+                seq_positions = mx.concatenate([positions, guiding_positions], axis=2)
+            else:
+                seq_latent = latents_flat
+                seq_timesteps = timesteps
+                seq_positions = positions
+
             video_modality = Modality(
-                latent=latents_flat,
-                timesteps=timesteps,
-                positions=positions,
+                latent=seq_latent,
+                timesteps=seq_timesteps,
+                positions=seq_positions,
                 context=text_embeddings,
                 context_mask=None,
                 enabled=True,
@@ -568,6 +598,9 @@ def denoise_distilled(
             velocity, audio_velocity = transformer(
                 video=video_modality, audio=audio_modality
             )
+            # Drop guiding token outputs — only use velocity for the video tokens.
+            if guiding_tokens is not None:
+                velocity = velocity[:, :num_tokens, :]
             mx.eval(velocity)
             if audio_velocity is not None:
                 mx.eval(audio_velocity)
@@ -1677,28 +1710,49 @@ def _build_i2v_conditionings(
     image_latent,
     image_frame_idx: int,
     image_strength: float,
-    end_image_latent=None,
-    end_image_strength: float = 1.0,
 ):
-    """Build a list of VideoConditionByLatentIndex for I2V conditioning.
-
-    Supports first-frame, last-frame, or both simultaneously.
-    """
+    """Build a list of VideoConditionByLatentIndex for first-frame I2V conditioning."""
     conditionings = []
     if image_latent is not None:
-        idx = 0 if end_image_latent is not None else image_frame_idx
         conditionings.append(
             VideoConditionByLatentIndex(
-                latent=image_latent, frame_idx=idx, strength=image_strength
-            )
-        )
-    if end_image_latent is not None:
-        conditionings.append(
-            VideoConditionByLatentIndex(
-                latent=end_image_latent, frame_idx=-1, strength=end_image_strength
+                latent=image_latent, frame_idx=image_frame_idx, strength=image_strength
             )
         )
     return conditionings
+
+
+def _prepare_guiding_tokens(
+    cond_latent: mx.array,
+    positions: mx.array,
+    latent_frames: int,
+    h: int,
+    w: int,
+) -> tuple:
+    """Prepare end-frame conditioning tokens for token-appending guidance.
+
+    Flattens the conditioning latent to token form and extracts the positional
+    encoding of the last latent frame so they can be appended to the video
+    sequence before the transformer forward pass (no hard token replacement,
+    which avoids abrupt appearance changes near the end frame).
+
+    Args:
+        cond_latent: Encoded end-image latent, shape (1, C, 1, h, w)
+        positions: Full position grid, shape (B, 3, F*h*w, 2)
+        latent_frames: Total number of latent frames F
+        h: Latent height
+        w: Latent width
+
+    Returns:
+        tokens: (1, h*w, C) conditioning tokens
+        frame_positions: (B, 3, h*w, 2) positions for the last latent frame
+    """
+    c = cond_latent.shape[1]
+    tokens = mx.transpose(mx.reshape(cond_latent, (1, c, -1)), (0, 2, 1))
+    start = (latent_frames - 1) * h * w
+    end = latent_frames * h * w
+    frame_positions = positions[:, :, start:end, :]
+    return tokens, frame_positions
 
 
 def generate_video(
@@ -2142,18 +2196,18 @@ def generate_video(
         )
         mx.eval(audio_positions, audio_latents)
 
-        # Apply I2V conditioning
+        # Apply I2V conditioning (first frame via replace, end frame via guiding tokens)
         state1 = None
-        if is_i2v and (stage1_image_latent is not None or stage1_end_image_latent is not None):
+        if stage1_image_latent is not None:
             latent_shape = (1, 128, latent_frames, stage1_h, stage1_w)
             state1 = LatentState(
                 latent=mx.zeros(latent_shape, dtype=model_dtype),
                 clean_latent=mx.zeros(latent_shape, dtype=model_dtype),
                 denoise_mask=mx.ones((1, 1, latent_frames, 1, 1), dtype=model_dtype),
             )
+            first_frame_idx = 0 if has_end_image else image_frame_idx
             conditionings = _build_i2v_conditionings(
-                stage1_image_latent, image_frame_idx, image_strength,
-                stage1_end_image_latent, end_image_strength,
+                stage1_image_latent, first_frame_idx, image_strength,
             )
             state1 = apply_conditioning(state1, conditionings)
 
@@ -2167,12 +2221,17 @@ def generate_video(
                 denoise_mask=state1.denoise_mask,
             )
             latents = state1.latent
-            mx.eval(latents)
         else:
             latents = mx.random.normal(
                 (1, 128, latent_frames, stage1_h, stage1_w), dtype=model_dtype
             )
-            mx.eval(latents)
+        mx.eval(latents)
+
+        s1_guiding_tokens, s1_guiding_positions = None, None
+        if stage1_end_image_latent is not None:
+            s1_guiding_tokens, s1_guiding_positions = _prepare_guiding_tokens(
+                stage1_end_image_latent, positions, latent_frames, stage1_h, stage1_w
+            )
 
         latents, audio_latents = denoise_distilled(
             latents,
@@ -2186,6 +2245,9 @@ def generate_video(
             audio_positions=audio_positions,
             audio_embeddings=audio_embeddings,
             audio_frozen=is_a2v,
+            guiding_tokens=s1_guiding_tokens,
+            guiding_positions=s1_guiding_positions,
+            guiding_strength=end_image_strength,
         )
 
         # Upsample latents
@@ -2221,15 +2283,15 @@ def generate_video(
         mx.eval(positions)
 
         state2 = None
-        if is_i2v and (stage2_image_latent is not None or stage2_end_image_latent is not None):
+        if stage2_image_latent is not None:
             state2 = LatentState(
                 latent=latents,
                 clean_latent=mx.zeros_like(latents),
                 denoise_mask=mx.ones((1, 1, latent_frames, 1, 1), dtype=model_dtype),
             )
+            first_frame_idx = 0 if has_end_image else image_frame_idx
             conditionings = _build_i2v_conditionings(
-                stage2_image_latent, image_frame_idx, image_strength,
-                stage2_end_image_latent, end_image_strength,
+                stage2_image_latent, first_frame_idx, image_strength,
             )
             state2 = apply_conditioning(state2, conditionings)
 
@@ -2250,6 +2312,13 @@ def generate_video(
             noise = mx.random.normal(latents.shape).astype(model_dtype)
             latents = noise * noise_scale + latents * one_minus_scale
             mx.eval(latents)
+
+        s2_guiding_tokens, s2_guiding_positions = None, None
+        if stage2_end_image_latent is not None:
+            positions2 = create_position_grid(1, latent_frames, stage2_h, stage2_w)
+            s2_guiding_tokens, s2_guiding_positions = _prepare_guiding_tokens(
+                stage2_end_image_latent, positions2, latent_frames, stage2_h, stage2_w
+            )
 
         # Re-noise audio at sigma=0.909375 for joint refinement (matches PyTorch)
         if audio_latents is not None and not is_a2v:
@@ -2273,6 +2342,9 @@ def generate_video(
             audio_positions=audio_positions,
             audio_embeddings=audio_embeddings,
             audio_frozen=is_a2v,
+            guiding_tokens=s2_guiding_tokens,
+            guiding_positions=s2_guiding_positions,
+            guiding_strength=end_image_strength,
         )
 
     elif pipeline == PipelineType.DEV:
@@ -2335,7 +2407,7 @@ def generate_video(
         # Initialize latents with optional I2V conditioning
         video_state = None
         video_latent_shape = (1, 128, latent_frames, latent_h, latent_w)
-        if is_i2v and (image_latent is not None or end_image_latent is not None):
+        if is_i2v and image_latent is not None:
             video_state = LatentState(
                 latent=mx.zeros(video_latent_shape, dtype=model_dtype),
                 clean_latent=mx.zeros(video_latent_shape, dtype=model_dtype),
@@ -2343,7 +2415,6 @@ def generate_video(
             )
             conditionings = _build_i2v_conditionings(
                 image_latent, image_frame_idx, image_strength,
-                end_image_latent, end_image_strength,
             )
             video_state = apply_conditioning(video_state, conditionings)
 
@@ -2466,7 +2537,7 @@ def generate_video(
         # Apply I2V conditioning for stage 1
         state1 = None
         stage1_shape = (1, 128, latent_frames, stage1_h, stage1_w)
-        if is_i2v and (stage1_image_latent is not None or stage1_end_image_latent is not None):
+        if is_i2v and stage1_image_latent is not None:
             state1 = LatentState(
                 latent=mx.zeros(stage1_shape, dtype=model_dtype),
                 clean_latent=mx.zeros(stage1_shape, dtype=model_dtype),
@@ -2474,7 +2545,6 @@ def generate_video(
             )
             conditionings = _build_i2v_conditionings(
                 stage1_image_latent, image_frame_idx, image_strength,
-                stage1_end_image_latent, end_image_strength,
             )
             state1 = apply_conditioning(state1, conditionings)
 
@@ -2575,7 +2645,7 @@ def generate_video(
         mx.eval(positions)
 
         state2 = None
-        if is_i2v and (stage2_image_latent is not None or stage2_end_image_latent is not None):
+        if is_i2v and stage2_image_latent is not None:
             state2 = LatentState(
                 latent=latents,
                 clean_latent=mx.zeros_like(latents),
@@ -2583,7 +2653,6 @@ def generate_video(
             )
             conditionings = _build_i2v_conditionings(
                 stage2_image_latent, image_frame_idx, image_strength,
-                stage2_end_image_latent, end_image_strength,
             )
             state2 = apply_conditioning(state2, conditionings)
 
@@ -2741,7 +2810,7 @@ def generate_video(
         # Apply I2V conditioning for stage 1
         state1 = None
         stage1_shape = (1, 128, latent_frames, stage1_h, stage1_w)
-        if is_i2v and (stage1_image_latent is not None or stage1_end_image_latent is not None):
+        if is_i2v and stage1_image_latent is not None:
             state1 = LatentState(
                 latent=mx.zeros(stage1_shape, dtype=model_dtype),
                 clean_latent=mx.zeros(stage1_shape, dtype=model_dtype),
@@ -2749,7 +2818,6 @@ def generate_video(
             )
             conditionings = _build_i2v_conditionings(
                 stage1_image_latent, image_frame_idx, image_strength,
-                stage1_end_image_latent, end_image_strength,
             )
             state1 = apply_conditioning(state1, conditionings)
 
@@ -2841,7 +2909,7 @@ def generate_video(
         mx.eval(positions)
 
         state2 = None
-        if is_i2v and (stage2_image_latent is not None or stage2_end_image_latent is not None):
+        if is_i2v and stage2_image_latent is not None:
             state2 = LatentState(
                 latent=latents,
                 clean_latent=mx.zeros_like(latents),
@@ -2849,7 +2917,6 @@ def generate_video(
             )
             conditionings = _build_i2v_conditionings(
                 stage2_image_latent, image_frame_idx, image_strength,
-                stage2_end_image_latent, end_image_strength,
             )
             state2 = apply_conditioning(state2, conditionings)
 
